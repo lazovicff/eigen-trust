@@ -11,8 +11,4 @@ ff = "0.11"
 rand = "0.8"
 group = "0.11"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
-ecdsa = { git = "https://github.com/TraceBundy/halo2wrong.git", branch = "master" }
-ecc = { git = "https://github.com/TraceBundy/halo2wrong.git", branch = "master" }
-integer = { git = "https://github.com/TraceBundy/halo2wrong.git", branch = "master" }
-maingate = { git = "https://github.com/TraceBundy/halo2wrong.git", branch = "master" }
-halo2wrong = { git = "https://github.com/TraceBundy/halo2wrong.git", branch = "master" }
+halo2wrong = { git = "https://github.com/privacy-scaling-explorations/halo2wrong.git", branch = "master" }

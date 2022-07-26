@@ -1,3 +1,3 @@
 cargo run -p eigen-trust --release -- \
---key 23jhTfVepCSFrkYE8tATMUuxU3SErCYvrShcit6dQfaonM4QxF82wh4k917LJShErtKNNbaUjmqGVDLDQdVB9n7TGieQ1 \
+--key 7VoQFngkSo36s5yzZtnjtZ5SLe1VGukCZdb5Uc9tSDNC \
 --address /ip4/127.0.0.1/tcp/58601

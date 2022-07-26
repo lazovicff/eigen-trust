@@ -2,13 +2,13 @@
 
 use crate::{
 	epoch::Epoch,
-	peer::{opinion::Opinion, MAX_NEIGHBORS},
+	peer::{opinion::Opinion, pubkey::Pubkey},
+	EigenError,
 };
 use async_trait::async_trait;
-use eigen_trust_circuit::{ecdsa::SigData, halo2wrong::curves::secp256k1::Fq as Secp256k1Scalar};
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::request_response::{ProtocolName, RequestResponseCodec};
-use std::io::Result;
+use std::io::{Error, ErrorKind, Result};
 
 /// EigenTrust protocol struct.
 #[derive(Debug, Clone, Default)]
@@ -43,19 +43,18 @@ pub struct EigenTrustCodec;
 
 /// The EigenTrust protocol request struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Request {
-	epoch: Epoch,
+pub enum Request {
+	Opinion(Epoch),
+	Identify(Pubkey),
 }
 
 impl Request {
-	/// Create a new request.
-	pub fn new(epoch: Epoch) -> Self {
-		Self { epoch }
-	}
-
 	/// Get the epoch of the request.
-	pub fn get_epoch(&self) -> Epoch {
-		self.epoch
+	pub fn get_epoch(&self) -> Option<Epoch> {
+		match self {
+			Self::Opinion(epoch) => Some(*epoch),
+			_ => None,
+		}
 	}
 }
 
@@ -63,11 +62,13 @@ impl Request {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Response {
 	/// Successful response with an opinion.
-	Success(Opinion<MAX_NEIGHBORS>),
+	Opinion(Opinion),
+	/// Successful response with a public key.
+	Identify(Pubkey),
 	/// Failed response, because of invalid request.
 	InvalidRequest,
 	/// Failed response, because of the internal error.
-	InternalError(u8),
+	InternalError(EigenError),
 }
 
 impl ProtocolName for EigenTrustProtocol {
@@ -96,10 +97,23 @@ impl RequestResponseCodec for EigenTrustCodec {
 	{
 		match protocol.version {
 			EigenTrustProtocolVersion::V1 => {
-				let mut buf = [0; 8];
+				let mut buf = [0; 1];
 				io.read_exact(&mut buf).await?;
-				let k = u64::from_be_bytes(buf);
-				Ok(Request::new(Epoch(k)))
+				match buf[0] {
+					0 => {
+						let mut k_buf = [0; 8];
+						io.read_exact(&mut k_buf).await?;
+						let k = u64::from_be_bytes(k_buf);
+						Ok(Request::Opinion(Epoch(k)))
+					},
+					1 => {
+						let mut pk_buf = [0; 32];
+						io.read_exact(&mut pk_buf).await?;
+						let pubkey = Pubkey::from_bytes(pk_buf);
+						Ok(Request::Identify(pubkey))
+					},
+					_ => Err(Error::new(ErrorKind::InvalidData, "Invalid request")),
+				}
 			},
 		}
 	}
@@ -122,39 +136,37 @@ impl RequestResponseCodec for EigenTrustCodec {
 						// Opinion
 						let mut k_bytes = [0; 8];
 						let mut op_bytes = [0; 8];
-						let mut r = [0; 32];
-						let mut s = [0; 32];
-						let mut m_hash = [0; 32];
 						let mut proof_bytes = Vec::new();
 
 						io.read_exact(&mut k_bytes).await?;
 						io.read_exact(&mut op_bytes).await?;
-						io.read_exact(&mut r).await?;
-						io.read_exact(&mut s).await?;
-						io.read_exact(&mut m_hash).await?;
 						io.read_to_end(&mut proof_bytes).await?;
 
 						let k = u64::from_be_bytes(k_bytes);
 						let op = f64::from_be_bytes(op_bytes);
 
-						let r_f = Secp256k1Scalar::from_bytes(&r).unwrap();
-						let s_f = Secp256k1Scalar::from_bytes(&s).unwrap();
-						let m_hash_f = Secp256k1Scalar::from_bytes(&m_hash).unwrap();
+						let epoch = Epoch(k);
+						let opinion = Opinion::new(epoch, op, proof_bytes);
 
-						let sig_data = SigData {
-							r: r_f,
-							s: s_f,
-							m_hash: m_hash_f,
-						};
-
-						let opinion = Opinion::new(Epoch(k), sig_data, op, proof_bytes);
-
-						Response::Success(opinion)
+						Ok(Response::Opinion(opinion))
 					},
-					1 => Response::InvalidRequest,
-					other => Response::InternalError(other),
+					1 => {
+						// Identify
+						let mut pubkey_bytes = [0; 32];
+						io.read_exact(&mut pubkey_bytes).await?;
+						let pubkey = Pubkey::from_bytes(pubkey_bytes);
+						Ok(Response::Identify(pubkey))
+					},
+					2 => Ok(Response::InvalidRequest),
+					3 => {
+						let mut err_code = [0; 1];
+						io.read_exact(&mut err_code).await?;
+						let err = EigenError::from(err_code[0]);
+						Ok(Response::InternalError(err))
+					},
+					_ => Err(Error::new(ErrorKind::InvalidData, "Invalid response")),
 				};
-				Ok(response)
+				response
 			},
 		}
 	}
@@ -171,8 +183,18 @@ impl RequestResponseCodec for EigenTrustCodec {
 	{
 		match protocol.version {
 			EigenTrustProtocolVersion::V1 => {
-				let k = req.get_epoch();
-				io.write_all(&k.to_be_bytes()).await?;
+				match req {
+					Request::Opinion(k) => {
+						let mut bytes = vec![0];
+						bytes.extend_from_slice(&k.to_be_bytes());
+						io.write_all(&bytes).await?;
+					},
+					Request::Identify(pub_key) => {
+						let mut bytes = vec![1];
+						bytes.extend_from_slice(&pub_key.to_bytes());
+						io.write_all(&bytes).await?;
+					},
+				}
 				Ok(())
 			},
 		}
@@ -192,19 +214,23 @@ impl RequestResponseCodec for EigenTrustCodec {
 			EigenTrustProtocolVersion::V1 => {
 				let mut bytes = Vec::new();
 				match res {
-					Response::Success(opinion) => {
+					Response::Opinion(opinion) => {
 						bytes.push(0);
 
 						// Opinion
-						bytes.extend(opinion.k.to_be_bytes());
+						bytes.extend(opinion.epoch.to_be_bytes());
 						bytes.extend(opinion.op.to_be_bytes());
-						bytes.extend(opinion.sig_i.r.to_bytes());
-						bytes.extend(opinion.sig_i.s.to_bytes());
-						bytes.extend(opinion.sig_i.m_hash.to_bytes());
 						bytes.extend(opinion.proof_bytes);
 					},
-					Response::InvalidRequest => bytes.push(1),
-					Response::InternalError(code) => bytes.push(code),
+					Response::Identify(pub_key) => {
+						bytes.push(1);
+						bytes.extend_from_slice(&pub_key.to_bytes());
+					},
+					Response::InvalidRequest => bytes.push(2),
+					Response::InternalError(code) => {
+						bytes.push(3);
+						bytes.push(code.into());
+					},
 				};
 				io.write_all(&bytes).await?;
 				Ok(())
@@ -218,9 +244,9 @@ mod tests {
 	use super::*;
 
 	impl Response {
-		pub fn success(self) -> Opinion<MAX_NEIGHBORS> {
+		pub fn success(self) -> Opinion {
 			match self {
-				Response::Success(opinion) => opinion,
+				Response::Opinion(opinion) => opinion,
 				_ => panic!("Response::success called on invalid response"),
 			}
 		}
@@ -231,26 +257,27 @@ mod tests {
 		let mut codec = EigenTrustCodec::default();
 		let mut buf = vec![];
 		let epoch = Epoch(1);
-		let req = Request::new(epoch);
+		let req = Request::Opinion(epoch);
 		codec
 			.write_request(&EigenTrustProtocol::default(), &mut buf, req)
 			.await
 			.unwrap();
 
-		let bytes = epoch.to_be_bytes();
+		let mut bytes = vec![0];
+		bytes.extend(epoch.to_be_bytes());
 		assert_eq!(buf, bytes);
 
 		let req = codec
 			.read_request(&EigenTrustProtocol::default(), &mut &bytes[..])
 			.await
 			.unwrap();
-		assert_eq!(req.get_epoch(), epoch);
+		assert_eq!(req.get_epoch().unwrap(), epoch);
 	}
 
 	#[tokio::test]
 	async fn should_correctly_write_read_success_response() {
 		let opinion = Opinion::empty();
-		let good_res = Response::Success(opinion.clone());
+		let good_res = Response::Opinion(opinion.clone());
 
 		let mut buf = vec![];
 		let mut codec = EigenTrustCodec::default();
@@ -261,11 +288,8 @@ mod tests {
 
 		let mut bytes = vec![];
 		bytes.push(0);
-		bytes.extend(opinion.k.to_be_bytes());
+		bytes.extend(opinion.epoch.to_be_bytes());
 		bytes.extend(opinion.op.to_be_bytes());
-		bytes.extend(opinion.sig_i.r.to_bytes());
-		bytes.extend(opinion.sig_i.s.to_bytes());
-		bytes.extend(opinion.sig_i.m_hash.to_bytes());
 
 		// compare the written bytes with the expected bytes
 		assert_eq!(buf, bytes);
@@ -290,7 +314,7 @@ mod tests {
 			.unwrap();
 
 		let mut bytes = vec![];
-		bytes.push(1);
+		bytes.push(2);
 		assert_eq!(buf, bytes);
 
 		let read_res = codec
@@ -304,7 +328,7 @@ mod tests {
 	#[tokio::test]
 	async fn should_correctly_write_read_internal_error_response() {
 		// Testing internal error
-		let bad_res = Response::InternalError(2);
+		let bad_res = Response::InternalError(EigenError::InvalidAddress);
 
 		let mut buf = vec![];
 		let mut codec = EigenTrustCodec::default();
@@ -314,7 +338,10 @@ mod tests {
 			.unwrap();
 
 		let mut bytes = vec![];
-		bytes.push(2);
+		// 3 is internal error code
+		bytes.push(3);
+		// 1 is invalid address error code
+		bytes.push(1);
 		assert_eq!(buf, bytes);
 
 		let read_res = codec

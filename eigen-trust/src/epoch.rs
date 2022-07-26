@@ -71,6 +71,11 @@ impl Epoch {
 	pub fn next(&self) -> Self {
 		Epoch(self.0 + 1)
 	}
+
+	/// Check if epoch is zero.
+	pub fn is_zero(&self) -> bool {
+		self.0 == 0
+	}
 }
 
 #[cfg(test)]

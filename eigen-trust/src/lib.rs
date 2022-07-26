@@ -84,6 +84,8 @@
 #![warn(trivial_casts)]
 #![forbid(unsafe_code)]
 
+/// The module for global constants.
+pub mod constants;
 /// The module for epoch-related calculations, like seconds until the next
 /// epoch, current epoch, etc.
 mod epoch;
@@ -104,13 +106,13 @@ pub use epoch::Epoch;
 pub use libp2p::{identity::Keypair, Multiaddr, PeerId};
 pub use log::LevelFilter;
 pub use node::Node;
-pub use peer::Peer;
-
-use eigen_trust_circuit::halo2wrong::halo2::plonk::Error as H2Error;
+pub use peer::{
+	utils::{extract_pub_key, extract_sk_bytes, extract_sk_limbs, keypair_from_sk_bytes},
+	Peer,
+};
 
 /// The crate-wide error variants.
-#[derive(Debug)]
-#[repr(u8)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EigenError {
 	/// Invalid keypair passed into node config.
 	InvalidKeypair,
@@ -141,6 +143,58 @@ pub enum EigenError {
 	ProvingError,
 	/// Verification error
 	VerificationError,
-	/// Halo2 error
-	Halo2Error(H2Error),
+	/// Failed to generate proving key.
+	KeygenFailed,
+	/// Invalid bootstrap public key.
+	InvalidBootstrapPubkey,
+	/// Unknown error.
+	Unknown,
+}
+
+impl From<EigenError> for u8 {
+	fn from(e: EigenError) -> u8 {
+		match e {
+			EigenError::InvalidKeypair => 0,
+			EigenError::InvalidAddress => 1,
+			EigenError::InvalidPubkey => 2,
+			EigenError::InvalidPeerId => 3,
+			EigenError::InvalidNumNeighbours => 4,
+			EigenError::PeerNotIdentified => 5,
+			EigenError::ListenFailed => 6,
+			EigenError::DialError => 7,
+			EigenError::MaxNeighboursReached => 8,
+			EigenError::EpochError => 9,
+			EigenError::SignatureError => 10,
+			EigenError::HashError => 11,
+			EigenError::ProvingError => 12,
+			EigenError::VerificationError => 13,
+			EigenError::KeygenFailed => 14,
+			EigenError::InvalidBootstrapPubkey => 15,
+			EigenError::Unknown => 16,
+		}
+	}
+}
+
+impl From<u8> for EigenError {
+	fn from(err: u8) -> Self {
+		match err {
+			0 => EigenError::InvalidKeypair,
+			1 => EigenError::InvalidAddress,
+			2 => EigenError::InvalidPubkey,
+			3 => EigenError::InvalidPeerId,
+			4 => EigenError::InvalidNumNeighbours,
+			5 => EigenError::PeerNotIdentified,
+			6 => EigenError::ListenFailed,
+			7 => EigenError::DialError,
+			8 => EigenError::MaxNeighboursReached,
+			9 => EigenError::EpochError,
+			10 => EigenError::SignatureError,
+			11 => EigenError::HashError,
+			12 => EigenError::ProvingError,
+			13 => EigenError::VerificationError,
+			14 => EigenError::KeygenFailed,
+			15 => EigenError::InvalidBootstrapPubkey,
+			_ => EigenError::Unknown,
+		}
+	}
 }

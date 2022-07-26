@@ -1,122 +1,170 @@
 //! The module for the main EigenTrust circuit.
 
 #![feature(array_try_map)]
+#![feature(array_zip)]
 #![allow(clippy::needless_range_loop)]
 
-pub mod ecdsa;
+pub mod gadgets;
 pub mod poseidon;
 pub mod utils;
 
-use crate::ecdsa::SigData;
-use ::ecdsa::ecdsa::{AssignedEcdsaSig, AssignedPublicKey, EcdsaChip};
-use ecc::{maingate::RegionCtx, EccConfig, GeneralEccChip};
+use gadgets::{
+	accumulate::{AccumulatorChip, AccumulatorConfig},
+	and::{AndChip, AndConfig},
+	is_equal::{IsEqualChip, IsEqualConfig},
+	mul::{MulChip, MulConfig},
+	select::{SelectChip, SelectConfig},
+	set::{FixedSetChip, FixedSetConfig},
+};
 pub use halo2wrong;
 use halo2wrong::halo2::{
-	arithmetic::{CurveAffine, FieldExt},
-	circuit::{Layouter, SimpleFloorPlanner},
-	plonk::{Circuit, ConstraintSystem, Error},
+	arithmetic::FieldExt,
+	circuit::{AssignedCell, Layouter, Region, SimpleFloorPlanner, Value},
+	plonk::{Advice, Circuit, Column, ConstraintSystem, Error, Instance},
 };
-use integer::{IntegerInstructions, Range, NUMBER_OF_LOOKUP_LIMBS};
-use maingate::{
-	MainGate, MainGateConfig, MainGateInstructions, RangeChip, RangeConfig, RangeInstructions,
-	UnassignedValue,
-};
+use poseidon::{params::RoundParams, PoseidonChip, PoseidonConfig};
 use std::marker::PhantomData;
-
-// Constants for halo2wrong
-const BIT_LEN_LIMB: usize = 68;
-const NUMBER_OF_LIMBS: usize = 4;
 
 /// The halo2 columns config for the main circuit.
 #[derive(Clone, Debug)]
 pub struct EigenTrustConfig {
-	main_gate_config: MainGateConfig,
-	range_config: RangeConfig,
-}
-
-impl EigenTrustConfig {
-	pub fn config_range<N: FieldExt>(&self, layouter: &mut impl Layouter<N>) -> Result<(), Error> {
-		let bit_len_lookup = BIT_LEN_LIMB / NUMBER_OF_LOOKUP_LIMBS;
-		let range_chip = RangeChip::<N>::new(self.range_config.clone(), bit_len_lookup);
-		range_chip.load_limb_range_table(layouter)?;
-		range_chip.load_overflow_range_tables(layouter)?;
-
-		Ok(())
-	}
+	// Gadgets
+	set: FixedSetConfig,
+	is_equal: IsEqualConfig,
+	and: AndConfig,
+	select: SelectConfig,
+	poseidon: PoseidonConfig<5>,
+	accumulator: AccumulatorConfig,
+	mul: MulConfig,
+	// EigenTrust columns
+	temp: Column<Advice>,
+	pub_ins: Column<Instance>,
 }
 
 /// The EigenTrust main circuit.
 #[derive(Clone)]
-pub struct EigenTrustCircuit<E: CurveAffine, N: FieldExt, const SIZE: usize> {
-	/// Public key of the prover.
-	pubkey_i: Option<E>,
-	/// Signature by the prover over the message: sig_i.m_hash.
-	sig_i: Option<SigData<E::ScalarExt>>,
+pub struct EigenTrustCircuit<
+	F: FieldExt,
+	const SIZE: usize,
+	const NUM_BOOTSTRAP: usize,
+	P: RoundParams<F, 5>,
+> {
+	pubkey_v: Value<F>,
+	epoch: Value<F>,
+	secret_i: [Value<F>; 4],
 	/// Opinions of peers j to the peer i (the prover).
-	op_ji: [Option<N>; SIZE],
+	op_ji: [Value<F>; SIZE],
 	/// Opinon from peer i (the prover) to the peer v (the verifyer).
-	c_v: Option<N>,
-	/// Min score of the peers.
-	min_score: N,
-	// Range chip values
-	aux_generator: Option<E>,
-	window_size: usize,
-	_marker: PhantomData<N>,
+	c_v: Value<F>,
+	// Bootstrap data
+	bootstrap_pubkeys: [F; NUM_BOOTSTRAP],
+	boostrap_score: Value<F>,
+	genesis_epoch: Value<F>,
+	_params: PhantomData<P>,
 }
 
-impl<E: CurveAffine, N: FieldExt, const SIZE: usize> EigenTrustCircuit<E, N, SIZE> {
+impl<F: FieldExt, const S: usize, const B: usize, P: RoundParams<F, 5>>
+	EigenTrustCircuit<F, S, B, P>
+{
 	/// Create a new EigenTrustCircuit.
 	pub fn new(
-		pubkey_i: E,
-		sig_i: SigData<E::ScalarExt>,
-		op_ji: [N; SIZE],
-		c_v: N,
-		min_score: N,
-		aux_generator: E,
+		pubkey_v: F,
+		epoch: F,
+		secret_i: [F; 4],
+		op_ji: [F; S],
+		c_v: F,
+		bootstrap_pubkeys: [F; B],
+		boostrap_score: F,
+		genesis_epoch: F,
 	) -> Self {
 		Self {
-			pubkey_i: Some(pubkey_i),
-			sig_i: Some(sig_i),
-			op_ji: op_ji.map(|c| Some(c)),
-			c_v: Some(c_v),
-
-			min_score,
-			aux_generator: Some(aux_generator),
-			window_size: 2,
-			_marker: PhantomData,
+			pubkey_v: Value::known(pubkey_v),
+			epoch: Value::known(epoch),
+			secret_i: secret_i.map(|val| Value::known(val)),
+			op_ji: op_ji.map(|c| Value::known(c)),
+			c_v: Value::known(c_v),
+			bootstrap_pubkeys,
+			boostrap_score: Value::known(boostrap_score),
+			genesis_epoch: Value::known(genesis_epoch),
+			_params: PhantomData,
 		}
+	}
+
+	pub fn assign_temp(
+		column: Column<Advice>,
+		name: &str,
+		region: &mut Region<'_, F>,
+		offset: &mut usize,
+		value: Value<F>,
+	) -> Result<AssignedCell<F, F>, Error> {
+		let res = region.assign_advice(|| name, column, *offset, || value)?;
+		*offset += 1;
+
+		Ok(res)
+	}
+
+	pub fn assign_fixed(
+		column: Column<Advice>,
+		name: &str,
+		region: &mut Region<'_, F>,
+		offset: &mut usize,
+		value: F,
+	) -> Result<AssignedCell<F, F>, Error> {
+		let res = region.assign_advice_from_constant(|| name, column, *offset, value)?;
+		*offset += 1;
+
+		Ok(res)
 	}
 }
 
-impl<E: CurveAffine, N: FieldExt, const SIZE: usize> Circuit<N> for EigenTrustCircuit<E, N, SIZE> {
+impl<F: FieldExt, const S: usize, const B: usize, P: RoundParams<F, 5>> Circuit<F>
+	for EigenTrustCircuit<F, S, B, P>
+{
 	type Config = EigenTrustConfig;
 	type FloorPlanner = SimpleFloorPlanner;
 
 	fn without_witnesses(&self) -> Self {
 		Self {
-			pubkey_i: None,
-			sig_i: None,
-			op_ji: [None; SIZE],
-			c_v: None,
-
-			min_score: self.min_score,
-			aux_generator: None,
-			window_size: self.window_size,
-			_marker: PhantomData,
+			pubkey_v: Value::unknown(),
+			epoch: Value::unknown(),
+			secret_i: [Value::unknown(); 4],
+			op_ji: [Value::unknown(); S],
+			c_v: Value::unknown(),
+			bootstrap_pubkeys: self.bootstrap_pubkeys,
+			boostrap_score: Value::unknown(),
+			genesis_epoch: Value::unknown(),
+			_params: PhantomData,
 		}
 	}
 
 	/// Make the circuit config.
-	fn configure(meta: &mut ConstraintSystem<N>) -> Self::Config {
-		let (rns_base, rns_scalar) = GeneralEccChip::<E, N, NUMBER_OF_LIMBS, BIT_LEN_LIMB>::rns();
-		let main_gate_config = MainGate::<N>::configure(meta);
-		let mut overflow_bit_lengths: Vec<usize> = vec![];
-		overflow_bit_lengths.extend(rns_base.overflow_lengths());
-		overflow_bit_lengths.extend(rns_scalar.overflow_lengths());
-		let range_config = RangeChip::<N>::configure(meta, &main_gate_config, overflow_bit_lengths);
+	fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+		let set = FixedSetChip::<_, B>::configure(meta);
+		let is_equal = IsEqualChip::configure(meta);
+		let and = AndChip::configure(meta);
+		let select = SelectChip::configure(meta);
+		let poseidon = PoseidonChip::<_, 5, P>::configure(meta);
+		let accumulator = AccumulatorChip::<_, S>::configure(meta);
+		let mul = MulChip::configure(meta);
+
+		let temp = meta.advice_column();
+		let fixed = meta.fixed_column();
+		let pub_ins = meta.instance_column();
+
+		meta.enable_equality(temp);
+		meta.enable_constant(fixed);
+		meta.enable_equality(pub_ins);
+
 		EigenTrustConfig {
-			main_gate_config,
-			range_config,
+			set,
+			is_equal,
+			and,
+			select,
+			poseidon,
+			accumulator,
+			mul,
+			temp,
+			pub_ins,
 		}
 	}
 
@@ -124,102 +172,120 @@ impl<E: CurveAffine, N: FieldExt, const SIZE: usize> Circuit<N> for EigenTrustCi
 	fn synthesize(
 		&self,
 		config: Self::Config,
-		mut layouter: impl Layouter<N>,
+		mut layouter: impl Layouter<F>,
 	) -> Result<(), Error> {
-		let mut ecc_chip = GeneralEccChip::<E, N, NUMBER_OF_LIMBS, BIT_LEN_LIMB>::new(
-			EccConfig::new(config.range_config.clone(), config.main_gate_config.clone()),
-		);
-		let scalar_chip = ecc_chip.scalar_field_chip();
-		let main_gate = MainGate::<N>::new(config.main_gate_config.clone());
+		let (zero, ops, c_v, sk, epoch, genesis_epoch, bootstrap_score, pubkey_v) = layouter
+			.assign_region(
+				|| "temp",
+				|mut region: Region<'_, F>| {
+					let mut offset = 0;
+					let zero = Self::assign_fixed(
+						config.temp,
+						"zero",
+						&mut region,
+						&mut offset,
+						F::zero(),
+					)?;
 
-		// Set up the Ecc chip
-		layouter.assign_region(
-			|| "assign_aux",
-			|mut region| {
-				let offset = &mut 0;
-				let ctx = &mut RegionCtx::new(&mut region, offset);
+					let sk = self
+						.secret_i
+						.try_map::<_, Result<AssignedCell<F, F>, Error>>(|v| {
+							Self::assign_temp(config.temp, "op", &mut region, &mut offset, v)
+						})?;
 
-				ecc_chip.assign_aux_generator(ctx, self.aux_generator)?;
-				ecc_chip.assign_aux(ctx, self.window_size, 1)?;
-				Ok(())
-			},
-		)?;
+					let epoch = Self::assign_temp(
+						config.temp,
+						"epoch",
+						&mut region,
+						&mut offset,
+						self.epoch,
+					)?;
+					let genesis_epoch = Self::assign_temp(
+						config.temp,
+						"genesis_epoch",
+						&mut region,
+						&mut offset,
+						self.genesis_epoch,
+					)?;
+					let bootstrap_score = Self::assign_temp(
+						config.temp,
+						"bootstrap_score",
+						&mut region,
+						&mut offset,
+						self.boostrap_score,
+					)?;
+					let pubkey_v = Self::assign_temp(
+						config.temp,
+						"pubkey_v",
+						&mut region,
+						&mut offset,
+						self.pubkey_v,
+					)?;
+					let c_v =
+						Self::assign_temp(config.temp, "c_v", &mut region, &mut offset, self.c_v)?;
 
-		// Calculate the opinion towards peer v.
-		let op_v = layouter.assign_region(
-			|| "t_i",
-			|mut region| {
-				let position = &mut 0;
-				let ctx = &mut RegionCtx::new(&mut region, position);
-				let unassigned_op_jis = self.op_ji.map(UnassignedValue::from);
-				let unassigned_c_v = UnassignedValue::from(self.c_v);
+					let ops = self
+						.op_ji
+						.try_map::<_, Result<AssignedCell<F, F>, Error>>(|op| {
+							Self::assign_temp(config.temp, "ops", &mut region, &mut offset, op)
+						})?;
 
-				let assigned_op_jis =
-					unassigned_op_jis.try_map(|val| main_gate.assign_value(ctx, &val))?;
+					Ok((
+						zero,
+						ops,
+						c_v,
+						sk,
+						epoch,
+						genesis_epoch,
+						bootstrap_score,
+						pubkey_v,
+					))
+				},
+			)?;
 
-				let assigned_c_v = main_gate.assign_value(ctx, &unassigned_c_v)?;
+		let acc_chip = AccumulatorChip::new(ops);
+		let t_i = acc_chip.synthesize(config.accumulator, layouter.namespace(|| "accumulator"))?;
 
-				let min_score = main_gate.assign_constant(ctx, self.min_score)?;
-				let mut sum = main_gate.assign_constant(ctx, N::zero())?;
-				// Calculate the sum of all opinions.
-				// t_i = op_1i + ... + op_nij
-				for i in 0..SIZE {
-					sum = main_gate.add(ctx, &sum, &assigned_op_jis[i])?;
-				}
-				// t_i = min_score + t_i
-				let t_i = main_gate.add(ctx, &sum, &min_score)?;
-				// Calculate the opinion
-				// op_v = t_i * c_v
-				let op = main_gate.mul(ctx, &t_i, &assigned_c_v)?;
+		// Recreate the pubkey_i
+		let inputs = [
+			zero.clone(),
+			sk[0].clone(),
+			sk[1].clone(),
+			sk[2].clone(),
+			sk[3].clone(),
+		];
+		let poseidon_pk = PoseidonChip::<_, 5, P>::new(inputs);
+		let res = poseidon_pk.synthesize(&config.poseidon, layouter.namespace(|| "poseidon_pk"))?;
+		let pubkey_i = res[0].clone();
 
-				Ok(op)
-			},
-		)?;
+		// Check the bootstrap set membership
+		let set_membership = FixedSetChip::new(self.bootstrap_pubkeys, pubkey_i.clone());
+		let is_bootstrap =
+			set_membership.synthesize(config.set, layouter.namespace(|| "set_membership"))?;
 
-		let ecdsa_chip = EcdsaChip::new(ecc_chip.clone());
+		// Is the epoch equal to the genesis epoch?
+		let is_eq_chip = IsEqualChip::new(epoch.clone(), genesis_epoch);
+		let is_genesis = is_eq_chip.synthesize(config.is_equal, layouter.namespace(|| "is_eq"))?;
 
-		// Verify the ecdsa signature.
-		let (r, s, m_hash, pk) = layouter.assign_region(
-			|| "sig_i_verify",
-			|mut region| {
-				let offset = &mut 0;
-				let ctx = &mut RegionCtx::new(&mut region, offset);
+		// Is this the bootstrap peer at genesis epoch?
+		let and_chip = AndChip::new(is_bootstrap, is_genesis);
+		let is_bootstrap_and_genesis =
+			and_chip.synthesize(config.and, layouter.namespace(|| "and"))?;
 
-				let unassigned_r = ecc_chip.new_unassigned_scalar(self.sig_i.map(|s| s.r));
-				let unassigned_s = ecc_chip.new_unassigned_scalar(self.sig_i.map(|s| s.s));
-				let unassigned_m_hash =
-					ecc_chip.new_unassigned_scalar(self.sig_i.map(|s| s.m_hash));
+		// Select the appropriate score, depending on the conditions
+		let select_chip = SelectChip::new(is_bootstrap_and_genesis, bootstrap_score, t_i);
+		let t_i_select = select_chip.synthesize(config.select, layouter.namespace(|| "select"))?;
 
-				let assigned_r = scalar_chip.assign_integer(ctx, unassigned_r, Range::Remainder)?;
-				let assigned_s = scalar_chip.assign_integer(ctx, unassigned_s, Range::Remainder)?;
-				let assigned_m_hash =
-					scalar_chip.assign_integer(ctx, unassigned_m_hash, Range::Remainder)?;
+		let mul_chip = MulChip::new(t_i_select, c_v);
+		let op_v = mul_chip.synthesize(config.mul, layouter.namespace(|| "mul"))?;
 
-				let pk_in_circuit = ecc_chip.assign_point(ctx, self.pubkey_i)?;
+		let m_hash_input = [zero, epoch, op_v, pubkey_v, pubkey_i];
+		let poseidon_m_hash = PoseidonChip::<_, 5, P>::new(m_hash_input);
+		let res = poseidon_m_hash
+			.synthesize(&config.poseidon, layouter.namespace(|| "poseidon_m_hash"))?;
+		let m_hash = res[0].clone();
 
-				let sig = AssignedEcdsaSig {
-					r: assigned_r.clone(),
-					s: assigned_s.clone(),
-				};
-				let assigned_pk = AssignedPublicKey {
-					point: pk_in_circuit.clone(),
-				};
-
-				ecdsa_chip.verify(ctx, &sig, &assigned_pk, &assigned_m_hash)?;
-
-				Ok((assigned_r, assigned_s, assigned_m_hash, pk_in_circuit))
-			},
-		)?;
-
-		config.config_range(&mut layouter)?;
-
-		// Constrain the values to public inputs.
-		main_gate.expose_public(layouter.namespace(|| "op_v"), op_v, 0)?;
-		main_gate.expose_public(layouter.namespace(|| "r"), r.native(), 1)?;
-		main_gate.expose_public(layouter.namespace(|| "s"), s.native(), 2)?;
-		main_gate.expose_public(layouter.namespace(|| "m_hash"), m_hash.native(), 3)?;
-		main_gate.expose_public(layouter.namespace(|| "pk_x"), pk.get_x().native(), 4)?;
-		main_gate.expose_public(layouter.namespace(|| "pk_y"), pk.get_y().native(), 5)?;
+		layouter.constrain_instance(m_hash.cell(), config.pub_ins, 0)?;
 
 		Ok(())
 	}
@@ -228,71 +294,54 @@ impl<E: CurveAffine, N: FieldExt, const SIZE: usize> Circuit<N> for EigenTrustCi
 #[cfg(test)]
 mod test {
 	use super::*;
-	use crate::ecdsa::{generate_signature, Keypair};
 	use halo2wrong::{
-		curves::{
-			bn256::{Bn256, Fr},
-			group::{Curve, Group},
-			secp256k1::{Fq, Secp256k1Affine as Secp256},
-		},
-		halo2::arithmetic::CurveAffine,
+		curves::bn256::{Bn256, Fr},
+		halo2::{arithmetic::Field, dev::MockProver},
 	};
-	use maingate::halo2::dev::MockProver;
+	use poseidon::{native::Poseidon, params::bn254_5x5::Params5x5Bn254};
 	use rand::thread_rng;
 	use utils::{generate_params, prove_and_verify};
 
-	const SIZE: usize = 12;
-
-	fn to_wide(p: [u8; 32]) -> [u8; 64] {
-		let mut res = [0u8; 64];
-		res[..32].copy_from_slice(&p[..]);
-		res
-	}
+	const SIZE: usize = 256;
+	const NUM_BOOTSTRAP: usize = 12;
+	const MAX_SCORE: u64 = 100000000;
 
 	#[test]
 	fn test_eigen_trust_verify() {
-		let k = 18;
+		let k = 13;
+
 		let mut rng = thread_rng();
+		let pubkey_v = Fr::random(&mut rng);
 
-		let m_hash = Fq::from_u128(12342);
-
-		// Data for prover
-		let pair_i = Keypair::<Secp256>::new(&mut rng);
-		let pubkey_i = pair_i.public().to_owned();
-		let sig_i = generate_signature(pair_i, m_hash, &mut rng).unwrap();
+		let epoch = Fr::one();
+		let sk = [(); 4].map(|_| Fr::random(&mut rng));
 
 		// Data from neighbors of i
 		let op_ji = [(); SIZE].map(|_| Fr::from_u128(1));
 		let c_v = Fr::from_u128(1);
 
-		// Aux generator
-		let aux_generator = <Secp256 as CurveAffine>::CurveExt::random(&mut rng).to_affine();
-		let min_score = Fr::from_u128(1);
-		let eigen_trust = EigenTrustCircuit::<_, _, SIZE>::new(
-			pubkey_i,
-			sig_i,
+		let bootstrap_pubkeys = [(); NUM_BOOTSTRAP].map(|_| Fr::random(&mut rng));
+		let bootstrap_score = Fr::from(MAX_SCORE);
+		let genesis_epoch = Fr::one();
+
+		let eigen_trust = EigenTrustCircuit::<Fr, SIZE, NUM_BOOTSTRAP, Params5x5Bn254>::new(
+			pubkey_v,
+			epoch,
+			sk,
 			op_ji,
 			c_v,
-			min_score,
-			aux_generator,
+			bootstrap_pubkeys,
+			bootstrap_score,
+			genesis_epoch,
 		);
 
-		let op = Fr::from_u128(SIZE as u128) + min_score;
-		let r = Fr::from_bytes_wide(&to_wide(sig_i.r.to_bytes()));
-		let s = Fr::from_bytes_wide(&to_wide(sig_i.s.to_bytes()));
-		let m_hash = Fr::from_bytes_wide(&to_wide(sig_i.m_hash.to_bytes()));
-		let pk_ix = Fr::from_bytes_wide(&to_wide(pubkey_i.x.to_bytes()));
-		let pk_iy = Fr::from_bytes_wide(&to_wide(pubkey_i.y.to_bytes()));
+		let inputs_sk = [Fr::zero(), sk[0], sk[1], sk[2], sk[3]];
+		let pubkey_i = Poseidon::<_, 5, Params5x5Bn254>::new(inputs_sk).permute()[0];
+		let opv = Fr::from(256);
+		let inputs = [Fr::zero(), epoch, opv, pubkey_v, pubkey_i];
+		let m_hash_poseidon = Poseidon::<_, 5, Params5x5Bn254>::new(inputs).permute()[0];
 
-		let mut pub_ins = Vec::new();
-		pub_ins.push(op);
-		pub_ins.push(r);
-		pub_ins.push(s);
-		pub_ins.push(m_hash);
-		pub_ins.push(pk_ix);
-		pub_ins.push(pk_iy);
-
-		let prover = match MockProver::<Fr>::run(k, &eigen_trust, vec![pub_ins]) {
+		let prover = match MockProver::<Fr>::run(k, &eigen_trust, vec![vec![m_hash_poseidon]]) {
 			Ok(prover) => prover,
 			Err(e) => panic!("{}", e),
 		};
@@ -302,48 +351,43 @@ mod test {
 
 	#[test]
 	fn test_eigen_trust_production_prove_verify() {
-		let k = 18;
+		let k = 13;
+
 		let mut rng = thread_rng();
+		let pubkey_v = Fr::random(&mut rng);
 
-		let m_hash = Fq::from_u128(12342);
-
-		// Data for prover
-		let pair_i = Keypair::<Secp256>::new(&mut rng);
-		let pubkey_i = pair_i.public().to_owned();
-		let sig_i = generate_signature(pair_i, m_hash, &mut rng).unwrap();
+		let epoch = Fr::one();
+		let sk = [(); 4].map(|_| Fr::random(&mut rng));
 
 		// Data from neighbors of i
 		let op_ji = [(); SIZE].map(|_| Fr::from_u128(1));
 		let c_v = Fr::from_u128(1);
 
-		// Aux generator
-		let aux_generator = <Secp256 as CurveAffine>::CurveExt::random(&mut rng).to_affine();
-		let min_score = Fr::from_u128(1);
-		let eigen_trust = EigenTrustCircuit::<_, _, SIZE>::new(
-			pubkey_i,
-			sig_i,
+		let bootstrap_pubkeys = [(); NUM_BOOTSTRAP].map(|_| Fr::random(&mut rng));
+		let bootstrap_score = Fr::from(MAX_SCORE);
+		let genesis_epoch = Fr::one();
+
+		let eigen_trust = EigenTrustCircuit::<Fr, SIZE, NUM_BOOTSTRAP, Params5x5Bn254>::new(
+			pubkey_v,
+			epoch,
+			sk,
 			op_ji,
 			c_v,
-			min_score,
-			aux_generator,
+			bootstrap_pubkeys,
+			bootstrap_score,
+			genesis_epoch,
 		);
 
-		let op = Fr::from_u128(SIZE as u128) + min_score;
-		let r = Fr::from_bytes_wide(&to_wide(sig_i.r.to_bytes()));
-		let s = Fr::from_bytes_wide(&to_wide(sig_i.s.to_bytes()));
-		let m_hash = Fr::from_bytes_wide(&to_wide(sig_i.m_hash.to_bytes()));
-		let pk_ix = Fr::from_bytes_wide(&to_wide(pubkey_i.x.to_bytes()));
-		let pk_iy = Fr::from_bytes_wide(&to_wide(pubkey_i.y.to_bytes()));
-
-		let mut pub_ins = Vec::new();
-		pub_ins.push(op);
-		pub_ins.push(r);
-		pub_ins.push(s);
-		pub_ins.push(m_hash);
-		pub_ins.push(pk_ix);
-		pub_ins.push(pk_iy);
+		let inputs_sk = [Fr::zero(), sk[0], sk[1], sk[2], sk[3]];
+		let pubkey_i = Poseidon::<_, 5, Params5x5Bn254>::new(inputs_sk).permute()[0];
+		let opv = Fr::from(256);
+		let inputs = [Fr::zero(), epoch, opv, pubkey_v, pubkey_i];
+		let m_hash_poseidon = Poseidon::<_, 5, Params5x5Bn254>::new(inputs).permute()[0];
 
 		let params = generate_params(k);
-		prove_and_verify::<Bn256, _, _>(params, eigen_trust, &[&pub_ins[..]], &mut rng).unwrap();
+		let res =
+			prove_and_verify::<Bn256, _, _>(params, eigen_trust, &[&[m_hash_poseidon]], &mut rng)
+				.unwrap();
+		assert!(res);
 	}
 }

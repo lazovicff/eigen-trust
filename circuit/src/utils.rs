@@ -1,16 +1,9 @@
 //! Helper functions for generating params, pk/vk pairs, creating and verifying
 //! proofs, etc.
 
-use crate::{
-	ecdsa::{generate_signature, Keypair},
-	EigenTrustCircuit,
-};
+use crate::{EigenTrustCircuit, RoundParams};
 use halo2wrong::{
-	curves::{
-		group::{Curve, Group},
-		pairing::{Engine, MultiMillerLoop},
-		CurveAffine,
-	},
+	curves::pairing::{Engine, MultiMillerLoop},
 	halo2::{
 		arithmetic::Field,
 		plonk::{
@@ -22,7 +15,7 @@ use halo2wrong::{
 			kzg::{
 				commitment::{KZGCommitmentScheme, ParamsKZG},
 				multiopen::{ProverSHPLONK, VerifierSHPLONK},
-				strategy::BatchVerifier,
+				strategy::AccumulatorStrategy,
 			},
 			VerificationStrategy,
 		},
@@ -57,28 +50,34 @@ pub fn read_params<E: MultiMillerLoop + Debug>(path: &str) -> ParamsKZG<E> {
 /// Make a new circuit with the inputs being random values.
 pub fn random_circuit<
 	E: MultiMillerLoop + Debug,
-	N: CurveAffine,
 	R: Rng + Clone,
 	const SIZE: usize,
+	const NUM_BOOTSTRAP: usize,
+	P: RoundParams<<E as Engine>::Scalar, 5>,
 >(
-	min_score: E::Scalar,
 	rng: &mut R,
-) -> EigenTrustCircuit<N, <E as Engine>::Scalar, SIZE> {
-	let m_hash = N::ScalarExt::random(rng.clone());
-
-	// Data for prover
-	let pair_i = Keypair::<N>::new(rng);
-	let pubkey_i = pair_i.public().to_owned();
-	let sig_i = generate_signature(pair_i, m_hash, rng).unwrap();
-
+) -> EigenTrustCircuit<<E as Engine>::Scalar, SIZE, NUM_BOOTSTRAP, P> {
+	let pubkey_v = E::Scalar::random(rng.clone());
+	let epoch = E::Scalar::random(rng.clone());
+	let secret_i = [(); 4].map(|_| E::Scalar::random(rng.clone()));
 	// Data from neighbors of i
 	let op_ji = [(); SIZE].map(|_| E::Scalar::random(rng.clone()));
-	let op_v = E::Scalar::random(rng.clone());
+	let c_v = E::Scalar::random(rng.clone());
 
-	// Aux generator
-	let aux_generator = N::CurveExt::random(rng.clone()).to_affine();
+	let bootstrap_pubkeys = [(); NUM_BOOTSTRAP].map(|_| E::Scalar::random(rng.clone()));
+	let bootstrap_score = E::Scalar::random(rng.clone());
+	let genesis_epoch = E::Scalar::random(rng.clone());
 
-	EigenTrustCircuit::<_, _, SIZE>::new(pubkey_i, sig_i, op_ji, op_v, min_score, aux_generator)
+	EigenTrustCircuit::<_, SIZE, NUM_BOOTSTRAP, P>::new(
+		pubkey_v,
+		epoch,
+		secret_i,
+		op_ji,
+		c_v,
+		bootstrap_pubkeys,
+		bootstrap_score,
+		genesis_epoch,
+	)
 }
 
 /// Proving/verifying key generation.
@@ -96,8 +95,7 @@ pub fn keygen<E: MultiMillerLoop + Debug, C: Circuit<E::Scalar>>(
 pub fn finalize_verify<
 	'a,
 	E: MultiMillerLoop + Debug,
-	R: Rng + Clone,
-	V: VerificationStrategy<'a, KZGCommitmentScheme<E>, VerifierSHPLONK<'a, E>, R>,
+	V: VerificationStrategy<'a, KZGCommitmentScheme<E>, VerifierSHPLONK<'a, E>>,
 >(
 	v: V,
 ) -> bool {
@@ -127,16 +125,15 @@ pub fn prove<E: MultiMillerLoop + Debug, C: Circuit<E::Scalar>, R: Rng + Clone>(
 }
 
 /// Verify a proof for generic circuit.
-pub fn verify<E: MultiMillerLoop + Debug, R: Rng + Clone>(
+pub fn verify<E: MultiMillerLoop + Debug>(
 	params: &ParamsKZG<E>,
 	pub_inps: &[&[<KZGCommitmentScheme<E> as CommitmentScheme>::Scalar]],
 	proof: &[u8],
 	vk: &VerifyingKey<E::G1Affine>,
-	rng: &mut R,
 ) -> Result<bool, Error> {
-	let strategy = BatchVerifier::<E, R>::new(params, rng.clone());
+	let strategy = AccumulatorStrategy::<E>::new(params);
 	let mut transcript = Blake2bRead::<_, E::G1Affine, Challenge255<_>>::init(proof);
-	let output = verify_proof::<KZGCommitmentScheme<E>, _, _, VerifierSHPLONK<E>, _, _>(
+	let output = verify_proof::<KZGCommitmentScheme<E>, _, _, VerifierSHPLONK<E>, _>(
 		params,
 		vk,
 		strategy,
@@ -159,7 +156,7 @@ pub fn prove_and_verify<E: MultiMillerLoop + Debug, C: Circuit<E::Scalar>, R: Rn
 	let proof = prove(&params, circuit, pub_inps, &pk, rng)?;
 	let end = start.elapsed();
 	print!("Proving time: {:?}", end.as_secs());
-	let res = verify(&params, pub_inps, &proof[..], pk.get_vk(), rng)?;
+	let res = verify(&params, pub_inps, &proof[..], pk.get_vk())?;
 
 	Ok(res)
 }

@@ -13,6 +13,7 @@ tokio = { version = "1.18", features = ["macros"] }
 futures = { version = "0.3.21", features = ["alloc"] }
 env_logger = "0.9.0"
 rand = "0.8"
+bs58 = "0.4.0"
 
 eigen-trust = { path = "../eigen-trust" }
 eigen-trust-circuit = { path = "../circuit" }
